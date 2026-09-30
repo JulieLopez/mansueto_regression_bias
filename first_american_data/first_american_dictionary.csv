@@ -1,0 +1,20 @@
+column,type,example_values,pct_missing_in_sample
+PropertyID,int64,165457307 | 218 | 12093,0.0
+Year,int64,2025 | 2024 | 2021,0.0
+Value,int64,6080 | 26820 | 4320,0.0
+MarketTotalValue,double,60800.0 | 268100.0 | 43200.0,5.1
+ApprTotalValue,null,,100.0
+PropertyClassID,string,V | R | A,0.0
+SitusLatitude,double,32.4691 | 32.644582 | 32.599278,0.0
+SitusLongitude,double,-86.4257 | -86.43089 | -86.653345,0.0
+SitusFullStreetAddress,string,573 COUNTY ROAD 64 | 2507 TANNER DR | 718 SILVER HILLS DR,2.7
+SitusCity,string,PRATTVILLE | DEATSVILLE | BILLINGSLEY,0.0
+SitusState,string,AL,0.0
+SitusZIP5,string,36066 | 36022 | 36067,0.0
+FIPS,string,01001,0.0
+SaleAmt,int64,430000 | 133500 | 36400,0.0
+TaxAmt,double,0.0 | 42462.0 | 83326.0,7.1
+TaxAmtAdjusted,double,0.0 | 424.62 | 833.26,7.1
+FIPS_CODE,string,01001,0.0
+tract,string,01001020503 | 01001020901 | 01001021000,0.0
+school_dist,string,0100240,0.0
