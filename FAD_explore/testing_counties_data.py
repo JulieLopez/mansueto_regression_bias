@@ -38,8 +38,3 @@ dict_df.to_csv("first_american_dictionary.csv", index=False)
 cook = dataset.to_table(
     filter=ds.field("FIPS") == "17031"
 ).to_pandas()
-
-print(len(cook))
-print(cook.head())
-print(cook["Year"].value_counts().sort_index())
-print(cook["PropertyClassID"].value_counts())
