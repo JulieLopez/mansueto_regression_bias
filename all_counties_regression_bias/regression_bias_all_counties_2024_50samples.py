@@ -1,11 +1,28 @@
 """
-THIS FILE: 2016, full year, 50 samples per noise level (1300 simulated samples total)
+THIS FILE: ALL COUNTIES (First American data), 2024, 50 samples per noise level (1,300 simulated samples per county).
 
 Monte Carlo noise simulation for assessment regressivity metrics.
-
 Python translation of monte_carlo_graphs.R from Eric's code (cmfproperty
-package, Center for Municipal Finance, UChicago), with the Gini and Suits
-measures from McMillen & Singh (2023) added.
+package, Center for Municipal Finance, UChicago), with the IAAO measures
+(VEI, MKI), LC, Gini and Suits added.
+
+Parts 1 and 2 (metrics, simulation) are the same as the Cook County version.
+Part 3 (loading), Part 4 (plots across counties) and RUN IT are new.
+
+WHAT THE COUNTY LOOP DOES (from the Sept 28 meeting)
+    - Loops over EVERY county file (one parquet per county, named by FIPS)
+    - Puts the counties in RANDOM order (fixed seed, so it's repeatable).
+      If a run stops partway, the counties finished so far are a random
+      mix from across the country, not just the first few states.
+    - Samples per noise level (ITERS): start with 1, then scale up to 100
+      ("cap it at 100 samples, start with 1")
+    - Saves after EVERY county; if the run stops (e.g. on rika), run the
+      script again and it picks up where it left off
+    - At the end, plots across counties:
+        * distribution of implied noise across counties
+        * implied noise vs number of sales (does sample size matter?)
+        * real score vs number of sales
+    - All outputs are named with the year and samples, e.g. "2024_1sample"
 
 THE IDEA IN ONE PARAGRAPH
 Pretend the assessor got every home exactly right, so each home's true value
@@ -17,24 +34,20 @@ caused purely by noise. Finally, compare each metric's score on the REAL data
 to these fake curves: "how much noise would it take for luck alone to produce
 a score this bad?"
 
-HOW TO USE
-    df = load_data(...)                 # needs SALE_PRICE and ASSESSED_VALUE
-    avg = monte_carlo_sim(df, iters=10) # the fake experiment
-    real = compute_all_metrics(df)      # scores on the real data
-    implied = implied_noise(avg, real)  # where real scores land on the curves
-    make_graphs(avg, real, implied)     # one graph per metric
-
 Differences from the R version are marked "NOTE (diff from R)".
 
 IAAO vertical equity measures (2026 exposure draft, section 8.2):
-    VEI  primary measure (Appendix E)   -> vei(), vei_details()   NEW
+    VEI  primary measure (Appendix E)   -> vei(), vei_details()
     PRB  the regression measure         -> prb()
-    MKI  Modified Kakwani Index         -> mki()                  NEW
+    MKI  Modified Kakwani Index         -> mki()
     PRD  price-related differential     -> prd()
 """
 
+import warnings
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # save graphs to files without opening windows (needed on rika)
 import matplotlib.pyplot as plt
 
 
@@ -460,15 +473,13 @@ def make_graphs(avg, real, implied, path="monte_carlo_graphs.png"):
 
 
 # =============================================================================
-# PART 3: LOADING DATA
+# PART 3: LOADING DATA (First American, one file per county)
 # =============================================================================
 
 def trim_outliers(df):
     """Drop extreme ratios within each year: anything more than 1.5 x IQR
     beyond the 25th/75th percentile. Matches cmfproperty's reformat_data().
-
-    (reformat_data() also makes inflation-adjusted copies of the columns,
-    but the Monte Carlo code never uses them, so they're skipped here.)"""
+    Runs per county, because each county is loaded separately."""
     r = df["ASSESSED_VALUE"] / df["SALE_PRICE"]
     by_year = r.groupby(df["SALE_YEAR"])
     q1 = by_year.transform(lambda s: s.quantile(0.25))  # each row gets its
@@ -477,99 +488,300 @@ def trim_outliers(df):
     return df[(r >= q1 - 1.5 * iqr) & (r <= q3 + 1.5 * iqr)]
 
 
-# CCAO's regression-modelled residential classes: the project's default
-# scope (Daniel's intro doc). Condos (299) are excluded because CCAO values
-# them a different way.
-REGRESSION_CLASSES = ["202", "203", "204", "205", "206", "207", "208",
-                      "209", "210", "211", "212", "234", "278", "295"]
+def load_county(path, year, trim=True):
+    """Load one county's residential sales from a First American file.
 
+    - One file per county, named by its FIPS code (17031.parquet = Cook)
+    - ASSESSED_VALUE = MarketTotalValue, the assessor's MARKET value
+      estimate, so no x10 like Cook's mailed_tot. ("Value" is the assessed
+      value after each state's assessment rate, so it isn't comparable to
+      sale price across states.) About 5% of rows have no market value;
+      those are dropped.
+    - PropertyClassID "R" = residential. Broader than CCAO's regression
+      classes (probably includes condos); this data has no detailed codes.
+    - NOTE: no arm's-length flag in this data, so non-market sales (family
+      transfers etc.) are still in. Trimming does more of the cleaning here
+      than it did with base.parquet.
+    - NOTE: the data dictionary doesn't say whether "Year" is the sale year
+      or the tax/assessment year. Worth confirming with Eric.
 
-def load_cook(path, year=None, trim=True, quarter=None):
-    """Load Cook County sales from base.parquet (see Daniel's intro doc).
+    Returns (data, state abbreviation)."""
+    df = pd.read_parquet(path, columns=["Year", "PropertyClassID",
+                                        "MarketTotalValue", "SaleAmt",
+                                        "SitusState"])
+    df = df[(df["Year"] == year) & (df["PropertyClassID"] == "R")]
 
-    - base.parquet is already filtered to valid (arm's-length) sales
-    - CCAO assesses at 10% of market value, so market value = mailed_tot * 10
-    - It stores ALL residential classes, so we keep only the regression
-      classes above
-    - trim=True drops extreme ratios the way Eric's package does. Set
-      trim=False to keep them (worth comparing: the cheap, heavily
-      over-assessed homes are exactly the ones trimming removes)
-    - quarter keeps only sales in those quarters (from the sale_date
-      column): e.g. 1, or [1, 2] for January-June combined.
-      None = the whole year. Trimming uses the whole year's cutoffs.
-    """
-    df = pd.read_parquet(path, columns=["year", "class", "mailed_tot",
-                                        "sale_price", "sale_date"])
-    df["class"] = df["class"].astype(str)
-    df = df[df["class"].isin(REGRESSION_CLASSES)]
-    if year is not None:
-        df = df[df["year"] == year]
+    states = df["SitusState"].dropna()
+    state = states.mode().iat[0] if len(states) else ""
+
     df = pd.DataFrame({
-        "SALE_YEAR": df["year"],
-        "QUARTER": pd.to_datetime(df["sale_date"]).dt.quarter,  # 1-4
-        "SALE_PRICE": df["sale_price"].astype(float),
-        "ASSESSED_VALUE": df["mailed_tot"].astype(float) * 10,
+        "SALE_YEAR": df["Year"],
+        "SALE_PRICE": df["SaleAmt"].astype(float),
+        "ASSESSED_VALUE": df["MarketTotalValue"].astype(float),
     }).dropna()
     df = df[(df["SALE_PRICE"] > 100) & (df["ASSESSED_VALUE"] > 100)]
-    if trim:
+    if trim and len(df):
         df = trim_outliers(df)
-    if quarter is not None:
-        quarters = [quarter] if isinstance(quarter, int) else list(quarter)
-        df = df[df["QUARTER"].isin(quarters)]
-    return df
+    return df, state
+
+
+# The columns of the results table, in a fixed order, so every county's row
+# lines up even when a county is skipped
+RESULT_COLS = (["order", "fips", "state", "n_sales", "status", "VEI_outcome"]
+               + [f"{m}_real" for m in METRICS]
+               + [f"{m}_implied_noise" for m in METRICS])
+
+
+def run_county(path, year, trim, iters, bootstrap, min_sales):
+    """Everything the Cook County RUN IT section did, for one county.
+    Returns (row, curves, real, implied); curves/real/implied are None if
+    the county was skipped."""
+    fips = path.stem
+    df, state = load_county(path, year, trim)
+    row = {"fips": fips, "state": state, "n_sales": len(df)}
+
+    if len(df) == 0:
+        row["status"] = f"no residential sales in {year}"
+        return row, None, None, None
+    if len(df) < min_sales:
+        row["status"] = f"skipped (fewer than {min_sales} sales)"
+        return row, None, None, None
+
+    real = compute_all_metrics(df)
+    avg = monte_carlo_sim(df, iters=iters, bootstrap_iters=bootstrap)
+    implied = implied_noise(avg, real)
+    d = vei_details(df["ASSESSED_VALUE"] / df["SALE_PRICE"],
+                    df["ASSESSED_VALUE"].to_numpy(float),
+                    df["SALE_PRICE"].to_numpy(float))
+
+    row["status"] = "ok"
+    row["VEI_outcome"] = d["outcome"]
+    for m in METRICS:
+        row[f"{m}_real"] = real[m]
+        row[f"{m}_implied_noise"] = implied[m]
+
+    avg.insert(0, "fips", fips)
+    return row, avg, real, implied
 
 
 # =============================================================================
-# RUN IT
+# PART 4: PLOTS ACROSS COUNTIES (meeting task)
+# =============================================================================
+
+PLOT_METRICS = METRICS  # all 12 metrics, same order as the 12-panel graphs
+
+
+def blank_reasons(res, curves):
+    """For every county and metric where the implied noise is blank, say WHY.
+    Uses the saved curves, so nothing needs to be rerun.
+
+    A blank means the real score is outside everything the curve reaches
+    between 0% and 25% noise. Two possible reasons:
+      "beyond 25%"  the real score is further in the regressive direction
+                    than even 25% noise produces -> noise can't explain it
+      "progressive" the real score is on the OTHER side of the 0%-noise
+                    (neutral) value. Noise only pushes toward regressivity,
+                    so no amount of noise can produce this score
+    (For COD, "beyond 25%" means more scattered than 25% noise produces.
+    median_ratio isn't classified: noise doesn't move it.)
+
+    Returns a copy of `res` with a <metric>_blank_reason column per metric:
+    "" if the implied noise was found, otherwise one of the two reasons."""
+    out = res.copy()
+    curves = curves.drop_duplicates(["fips", "noise"], keep="last")
+    by_fips = dict(tuple(curves.sort_values("noise").groupby("fips")))
+    for m in METRICS:
+        reasons = []
+        for _, row in out.iterrows():
+            real = row.get(f"{m}_real")
+            if row.get("status") != "ok" or pd.isna(real):
+                reasons.append("")
+            elif not pd.isna(row.get(f"{m}_implied_noise")):
+                reasons.append("")          # matched, no blank
+            elif m == "median_ratio":
+                reasons.append("n/a (noise doesn't move it)")
+            else:
+                c = by_fips.get(row["fips"])
+                if c is None:
+                    reasons.append("unknown (no curve saved)")
+                    continue
+                start = c[m].iloc[0]        # score at 0% noise (neutral)
+                direction = np.sign(c[m].iloc[-1] - start)  # way noise pushes
+                if direction * (real - start) < 0:
+                    reasons.append("progressive")
+                else:
+                    reasons.append("beyond 25%")
+        out[f"{m}_blank_reason"] = reasons
+    return out
+
+
+def plot_across_counties(res, tag, out_dir):
+    """Three figures from the results table, one panel per metric.
+      distribution    how implied noise varies across counties. The title
+                      counts the counties NOT in the bars, split by reason:
+                      "beyond 25%" (noise can't explain it) and
+                      "progressive" (noise can never produce it)
+      noise_vs_sales  implied noise vs number of sales: does sample size
+                      change the answer?
+      score_vs_sales  the REAL score vs number of sales: do small counties
+                      get more extreme scores? (always available, even
+                      when implied noise is blank)"""
+    ok = res[res["status"] == "ok"]
+    if len(ok) == 0:
+        return
+    figs = {name: plt.subplots(4, 3, figsize=(13, 15))
+            for name in ["distribution", "noise_vs_sales", "score_vs_sales"]}
+    for i, m in enumerate(PLOT_METRICS):
+        noise = ok[f"{m}_implied_noise"] * 100
+        a1 = figs["distribution"][1].flat[i]
+        a1.hist(noise.dropna(), bins=30)
+        reason_col = f"{m}_blank_reason"
+        if m == "median_ratio":
+            a1.set_title(f"{m}  (noise doesn't move it)", fontsize=10)
+        elif reason_col in ok.columns:
+            n_beyond = (ok[reason_col] == "beyond 25%").sum()
+            n_prog = (ok[reason_col] == "progressive").sum()
+            a1.set_title(f"{m}  ({len(ok)} counties)\n"
+                         f"not shown: {n_beyond} beyond 25%, "
+                         f"{n_prog} progressive", fontsize=10)
+        else:
+            a1.set_title(f"{m}  ({noise.isna().sum()} of {len(ok)} blank)",
+                         fontsize=10)
+        a1.set_xlabel("Implied noise (%)")
+        a1.set_ylabel("Number of counties")
+
+        a2 = figs["noise_vs_sales"][1].flat[i]
+        a2.scatter(ok["n_sales"], noise, s=8, alpha=0.5)
+        a2.set_ylabel("Implied noise (%)")
+
+        a3 = figs["score_vs_sales"][1].flat[i]
+        a3.scatter(ok["n_sales"], ok[f"{m}_real"], s=8, alpha=0.5)
+        a3.set_ylabel("Real score")
+
+        for a in (a2, a3):
+            a.set_title(m)
+            a.set_xscale("log")
+            a.set_xlabel("Number of sales (log scale)")
+    for name, (fig, _) in figs.items():
+        fig.suptitle(f"All counties, {tag.replace('_', ', ')}")
+        fig.tight_layout(rect=[0, 0, 1, 0.98])  # leave room for the title
+        fig.savefig(out_dir / f"counties_{name}_{tag}.png", dpi=120)
+        plt.close(fig)
+
+
+# =============================================================================
+# RUN IT (loops over the counties)
 # =============================================================================
 
 if __name__ == "__main__":
     from pathlib import Path
 
     # ---- Settings: change these ------------------------------------------
-    # Where base.parquet lives. This is the Box Drive location from the
-    # intro doc; if you downloaded it elsewhere, put that path here instead.
-    DATA = Path.home() / "regression_bias/base.parquet"
-    YEAR = 2016     # which year of sales to use (2000-2025)
-    QUARTERS = None  # quarters to include, COMBINED into one sample
-                       # ([1, 2] = Jan-June). None = the whole year
-    TRIM = True     # True = drop extreme ratios like Eric's code; False = keep all
-    ITERS = 50      # simulated samples per noise level
-    BOOTSTRAP = 5   # Eric's inner loop (5 = same as his R code; 0 = skip)
+    # Folder with the county parquet files (unzipped). The code also looks
+    # inside any subfolders, so it's fine if the files are one level deeper
+    DATA_DIR = Path("/Users/julie/regression_bias/all_counties_regression_bias/first_american_data")
+    YEAR = 2024        # which year of sales to use
+    TRIM = True        # True = drop extreme ratios like Eric's code
+    ITERS = 50         # simulated samples per noise level
+    BOOTSTRAP = 5      # Eric's inner loop (5 = same as his R code; 0 = skip)
+    MIN_SALES = 100    # skip counties with fewer sales than this
+    SEED = 0           # fixes the random county order
+    GRAPH_COUNTIES = ["17031"]  # FIPS codes to also save 12-panel graphs for
+                                # (17031 = Cook County)
 
-    # ---- Load the data -----------------------------------------------------
-    df = load_cook(DATA, year=YEAR, trim=TRIM, quarter=QUARTERS)
-    if QUARTERS is None:
-        when, q = f"{YEAR}", ""
-    else:
-        q = "Q" + "-Q".join(str(x) for x in QUARTERS)   # e.g. "Q1-Q2"
-        when = f"{YEAR} {q}"
-    print(f"{len(df):,} sales in {when} (trim={TRIM})")
+    # Small counties can make the regressions throw math warnings; they
+    # don't stop anything, so hide them to keep the progress output readable
+    warnings.filterwarnings("ignore", category=RuntimeWarning)
+    rank_warning = getattr(getattr(np, "exceptions", np), "RankWarning", None)
+    if rank_warning is not None:
+        warnings.filterwarnings("ignore", category=rank_warning)
 
-    # ---- IAAO VEI compliance check on the real data -------------------------
-    d = vei_details(df["ASSESSED_VALUE"] / df["SALE_PRICE"],
-                    df["ASSESSED_VALUE"].to_numpy(float),
-                    df["SALE_PRICE"].to_numpy(float))
-    print(f"\nVEI = {d['VEI']:.2f}   significance = {d['VEI_significance']:.2f}"
-          f"   -> {d['outcome']}")
-    print(d["groups"].round(4).to_string(index=False), "\n")
+    # ---- Where results go ---------------------------------------------------
+    # Folder and file names include the year and samples, e.g. "2024_1sample"
+    tag = f"2024_{ITERS}sample{'' if ITERS == 1 else 's'}"
+    if not TRIM:
+        tag += "_notrim"
+    out_dir = Path(f"results_{tag}")
+    out_dir.mkdir(exist_ok=True)
+    results_file = out_dir / f"county_results_{tag}.csv"    # 1 row per county
+    curves_file = out_dir / f"county_sim_curves_{tag}.csv"  # 26 rows per county
 
-    # ---- Run everything ----------------------------------------------------
-    real = compute_all_metrics(df)          # scores on the real data
-    avg = monte_carlo_sim(df, iters=ITERS, bootstrap_iters=BOOTSTRAP)
-    print(f"Ran {len(avg) * ITERS} simulated samples "
-          f"({len(avg)} noise levels x {ITERS} per level)")
-    implied = implied_noise(avg, real)      # where real scores hit the curves
+    # ---- Random order -------------------------------------------------------
+    # Same SEED = same order every time, so a resumed run continues in order
+    # Look in the folder AND its subfolders; skip the hidden "._" copies and
+    # "__MACOSX" folder that unzipping on a Mac can create
+    files = sorted(p for p in DATA_DIR.rglob("*.parquet")
+                   if not p.name.startswith("._") and "__MACOSX" not in p.parts)
+    if not files:
+        raise SystemExit(f"No .parquet files in {DATA_DIR}. Unzipped yet?")
+    rng = np.random.default_rng(SEED)
+    files = [files[i] for i in rng.permutation(len(files))]
 
-    # ---- Show and save results ---------------------------------------------
-    summary = pd.DataFrame({"real score": real, "implied noise": implied})
-    print(summary.round(4))
+    # ---- Resume: skip counties already finished -----------------------------
+    # (counties that hit an error are tried again)
+    done, n_ok = set(), 0
+    if results_file.exists():
+        prev = pd.read_csv(results_file, dtype={"fips": str})
+        prev = prev[~prev["status"].astype(str).str.startswith("error")]
+        done = set(prev["fips"])
+        n_ok = int((prev["status"] == "ok").sum())
+    print(f"{len(files)} county files found, {len(done)} already done "
+          f"({n_ok} ran)\n")
 
-    # File names include the year, quarters, trim setting and number of
-    # samples per noise level, so runs don't overwrite each other
-    # (e.g. summary_2024Q1-Q2_trim_25samples.csv)
-    tag = f"{YEAR}{q}_{'trim' if TRIM else 'notrim'}_{ITERS}sample{'s' if ITERS != 1 else ''}"
-    avg.to_csv(f"sim_curves_{tag}.csv", index=False)
-    summary.to_csv(f"summary_{tag}.csv")
-    make_graphs(avg, real, implied, path=f"graphs_{tag}.png")
-    print(f"Saved sim_curves_{tag}.csv, summary_{tag}.csv, graphs_{tag}.png")
+    # ---- The loop -------------------------------------------------------------
+    for i, path in enumerate(files, 1):
+        fips = path.stem
+        if fips in done:
+            continue
+
+        avg = real = implied = None
+        try:
+            row, avg, real, implied = run_county(path, YEAR, TRIM, ITERS,
+                                                 BOOTSTRAP, MIN_SALES)
+        except Exception as e:
+            # One broken county shouldn't stop the whole run
+            row = {"fips": fips, "status": f"error: {e}"}
+        row["order"] = i  # position in the random order
+
+        # Save this county's row right away
+        pd.DataFrame([row]).reindex(columns=RESULT_COLS).to_csv(
+            results_file, mode="a", header=not results_file.exists(),
+            index=False)
+        if avg is not None:
+            n_ok += 1
+            avg.to_csv(curves_file, mode="a",
+                       header=not curves_file.exists(), index=False)
+            if fips in GRAPH_COUNTIES:
+                fig = make_graphs(avg, real, implied,
+                                  path=out_dir / f"graphs_{fips}_{tag}.png")
+                plt.close(fig)  # free memory inside the loop
+
+        print(f"[{i}/{len(files)}] {fips} {row.get('state', '')}: "
+              f"{row['status']} (n={row.get('n_sales', '?')})")
+
+    # ---- Summary + plots across counties ------------------------------------
+    res = pd.read_csv(results_file, dtype={"fips": str})
+    res = res.drop_duplicates("fips", keep="last")  # retried errors
+    ok = res[res["status"] == "ok"]
+    print(f"\n{len(ok)} counties ran, {len(res) - len(ok)} skipped or errored")
+    if len(ok):
+        print("\nMedian implied noise across counties, by metric:")
+        print(ok[[f"{m}_implied_noise" for m in METRICS]]
+              .median().round(4).to_string())
+        # Why was implied noise blank? (built from the saved curves, so this
+        # also works on a finished run without redoing any counties)
+        if curves_file.exists():
+            curves = pd.read_csv(curves_file, dtype={"fips": str})
+            res = blank_reasons(res, curves)
+            labeled_file = out_dir / f"county_results_{tag}_with_reasons.csv"
+            res.to_csv(labeled_file, index=False)
+            ok = res[res["status"] == "ok"]
+            print("\nCounties with blank implied noise, by reason:")
+            counts = pd.DataFrame({
+                m: ok[f"{m}_blank_reason"].value_counts()
+                for m in METRICS if m != "median_ratio"}).fillna(0).astype(int)
+            print(counts.drop(index="", errors="ignore").T.to_string())
+            print(f"(reasons for each county saved in {labeled_file.name})")
+        plot_across_counties(res, tag, out_dir)
+    print(f"\nSaved to {out_dir}/")
+    
