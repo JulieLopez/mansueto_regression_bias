@@ -22,7 +22,15 @@ WHAT THE COUNTY LOOP DOES (from the Sept 28 meeting)
         * distribution of implied noise across counties
         * implied noise vs number of sales (does sample size matter?)
         * real score vs number of sales
-    - All outputs are named with the year and samples, e.g. "2024_1sample"
+    - All outputs are named with the year, samples, value column and filters,
+      e.g. "2024_1sample_value_nofilter"
+
+UPDATED AFTER ERIC'S REPLY
+    - Uses "Value" (assessed value) instead of MarketTotalValue by default,
+      with a level adjustment so the typical ratio is 1.0
+    - Filtering is a set of switches (FILTERS). ON by default: the
+      $10k-$5M value window and the 1.5 x IQR trim. Off: highest sale per
+      property (Eric's join script already does it) and 1%/99% winsorize
 
 THE IDEA IN ONE PARAGRAPH
 Pretend the assessor got every home exactly right, so each home's true value
@@ -488,57 +496,105 @@ def trim_outliers(df):
     return df[(r >= q1 - 1.5 * iqr) & (r <= q3 + 1.5 * iqr)]
 
 
-def load_county(path, year, trim=True):
+# Filtering options Eric listed (all off by default: he said "probably
+# picking none of these is fine for now", but each one can change results)
+FILTER_NAMES = {
+    "highest_sale": "keep only the highest sale per property per year",
+    "value_window": "drop sale prices / market values outside $10k-$5M",
+    "winsorize": "cap sale prices and values at their 1st/99th percentiles",
+    "iqr_trim": "drop ratios outside 1.5 x IQR (IAAO; Eric's R package)",
+}
+
+
+def apply_filters(df, filters):
+    """Apply whichever filters are switched on, in this order:
+    highest sale -> $10k-$5M window -> 1%/99% winsorize -> 1.5 x IQR trim.
+    Not available in this data: deed/owner-name filtering (no owner or deed
+    columns) and the variance-measure checks (to add later if needed)."""
+    if filters.get("highest_sale"):
+        # one row per property per year: the highest sale price
+        df = (df.sort_values("SALE_PRICE")
+                .drop_duplicates(["PROPERTY_ID", "SALE_YEAR"], keep="last"))
+    if filters.get("value_window"):
+        # market value = assessed value rescaled to the county's level
+        mkt = df["ASSESSED_VALUE"] / np.median(df["ASSESSED_VALUE"] / df["SALE_PRICE"])
+        keep = df["SALE_PRICE"].between(10_000, 5_000_000) & mkt.between(10_000, 5_000_000)
+        df = df[keep]
+    if filters.get("winsorize") and len(df):
+        df = df.copy()
+        for col in ["SALE_PRICE", "ASSESSED_VALUE"]:
+            lo, hi = df[col].quantile([0.01, 0.99])
+            df[col] = df[col].clip(lo, hi)
+    if filters.get("iqr_trim") and len(df):
+        df = trim_outliers(df)
+    return df
+
+
+def load_county(path, year, value_col="Value", filters=None):
     """Load one county's residential sales from a First American file.
 
     - One file per county, named by its FIPS code (17031.parquet = Cook)
-    - ASSESSED_VALUE = MarketTotalValue, the assessor's MARKET value
-      estimate, so no x10 like Cook's mailed_tot. ("Value" is the assessed
-      value after each state's assessment rate, so it isn't comparable to
-      sale price across states.) About 5% of rows have no market value;
-      those are dropped.
-    - PropertyClassID "R" = residential. Broader than CCAO's regression
-      classes (probably includes condos); this data has no detailed codes.
-    - NOTE: no arm's-length flag in this data, so non-market sales (family
-      transfers etc.) are still in. Trimming does more of the cleaning here
-      than it did with base.parquet.
-    - NOTE: the data dictionary doesn't say whether "Year" is the sale year
-      or the tax/assessment year. Worth confirming with Eric.
+    - ASSESSED_VALUE comes from `value_col`:
+        "Value" (default, per Eric): the assessed/taxable value. In most
+          states it's a fixed % of market value (e.g. 10% in Cook), which
+          the level adjustment below takes care of. Where exemptions or
+          caps make it a DIFFERENT % for different homes, results can be
+          off; those counties should stand out in the distribution.
+        "MarketTotalValue": the assessor's market value estimate. Often
+          missing, but useful for places with capped values (e.g. CA).
+    - PropertyClassID "R" = residential (probably includes condos)
+    - No arm's-length flag in this data, so non-market sales are still in
+    - The data dictionary doesn't say whether "Year" is the sale year or the
+      tax year (Eric's script that builds the joined files should say)
 
-    Returns (data, state abbreviation)."""
-    df = pd.read_parquet(path, columns=["Year", "PropertyClassID",
-                                        "MarketTotalValue", "SaleAmt",
-                                        "SitusState"])
+    Returns (data, state abbreviation, raw median ratio)."""
+    df = pd.read_parquet(path, columns=["PropertyID", "Year", "PropertyClassID",
+                                        value_col, "SaleAmt", "SitusState"])
     df = df[(df["Year"] == year) & (df["PropertyClassID"] == "R")]
 
     states = df["SitusState"].dropna()
     state = states.mode().iat[0] if len(states) else ""
 
     df = pd.DataFrame({
+        "PROPERTY_ID": df["PropertyID"],
         "SALE_YEAR": df["Year"],
         "SALE_PRICE": df["SaleAmt"].astype(float),
-        "ASSESSED_VALUE": df["MarketTotalValue"].astype(float),
+        "ASSESSED_VALUE": df[value_col].astype(float),
     }).dropna()
     df = df[(df["SALE_PRICE"] > 100) & (df["ASSESSED_VALUE"] > 100)]
-    if trim and len(df):
-        df = trim_outliers(df)
-    return df, state
+    df = apply_filters(df, filters or {})
+
+    # LEVEL ADJUSTMENT. "Value" is often a fraction of market value (10%,
+    # 19%, 35%...). Divide every assessed value by the county's median ratio
+    # so the typical ratio is 1.0, the same scale as the simulation (where
+    # assessed value = true value). This changes NOTHING for PRD, PRB, VEI,
+    # MKI, COD, Gini, Suits, LC or Cheng (they only care about the pattern,
+    # not the level), but it keeps Paglin and IAAO78, which are in dollar
+    # units, comparable to their curves. The real median ratio is kept in
+    # the results as raw_median_ratio.
+    raw_med = np.nan
+    if len(df):
+        raw_med = float(np.median(df["ASSESSED_VALUE"] / df["SALE_PRICE"]))
+        df = df.assign(ASSESSED_VALUE=df["ASSESSED_VALUE"] / raw_med)
+    return df, state, raw_med
 
 
 # The columns of the results table, in a fixed order, so every county's row
 # lines up even when a county is skipped
-RESULT_COLS = (["order", "fips", "state", "n_sales", "status", "VEI_outcome"]
+RESULT_COLS = (["order", "fips", "state", "n_sales", "status", "VEI_outcome",
+                "raw_median_ratio"]
                + [f"{m}_real" for m in METRICS]
                + [f"{m}_implied_noise" for m in METRICS])
 
 
-def run_county(path, year, trim, iters, bootstrap, min_sales):
+def run_county(path, year, value_col, filters, iters, bootstrap, min_sales):
     """Everything the Cook County RUN IT section did, for one county.
     Returns (row, curves, real, implied); curves/real/implied are None if
     the county was skipped."""
     fips = path.stem
-    df, state = load_county(path, year, trim)
-    row = {"fips": fips, "state": state, "n_sales": len(df)}
+    df, state, raw_med = load_county(path, year, value_col, filters)
+    row = {"fips": fips, "state": state, "n_sales": len(df),
+           "raw_median_ratio": raw_med}
 
     if len(df) == 0:
         row["status"] = f"no residential sales in {year}"
@@ -568,13 +624,59 @@ def run_county(path, year, trim, iters, bootstrap, min_sales):
 # PART 4: PLOTS ACROSS COUNTIES (meeting task)
 # =============================================================================
 
-PLOT_METRICS = ["VEI", "PRB", "MKI", "PRD", "LC", "COD"]  # IAAO 4 + LC + COD
+PLOT_METRICS = METRICS  # all 12 metrics, same order as the 12-panel graphs
+
+
+def blank_reasons(res, curves):
+    """For every county and metric where the implied noise is blank, say WHY.
+    Uses the saved curves, so nothing needs to be rerun.
+
+    A blank means the real score is outside everything the curve reaches
+    between 0% and 25% noise. Two possible reasons:
+      "beyond 25%"  the real score is further in the regressive direction
+                    than even 25% noise produces -> noise can't explain it
+      "progressive" the real score is on the OTHER side of the 0%-noise
+                    (neutral) value. Noise only pushes toward regressivity,
+                    so no amount of noise can produce this score
+    (For COD, "beyond 25%" means more scattered than 25% noise produces.
+    median_ratio isn't classified: noise doesn't move it.)
+
+    Returns a copy of `res` with a <metric>_blank_reason column per metric:
+    "" if the implied noise was found, otherwise one of the two reasons."""
+    out = res.copy()
+    curves = curves.drop_duplicates(["fips", "noise"], keep="last")
+    by_fips = dict(tuple(curves.sort_values("noise").groupby("fips")))
+    for m in METRICS:
+        reasons = []
+        for _, row in out.iterrows():
+            real = row.get(f"{m}_real")
+            if row.get("status") != "ok" or pd.isna(real):
+                reasons.append("")
+            elif not pd.isna(row.get(f"{m}_implied_noise")):
+                reasons.append("")          # matched, no blank
+            elif m == "median_ratio":
+                reasons.append("n/a (noise doesn't move it)")
+            else:
+                c = by_fips.get(row["fips"])
+                if c is None:
+                    reasons.append("unknown (no curve saved)")
+                    continue
+                start = c[m].iloc[0]        # score at 0% noise (neutral)
+                direction = np.sign(c[m].iloc[-1] - start)  # way noise pushes
+                if direction * (real - start) < 0:
+                    reasons.append("progressive")
+                else:
+                    reasons.append("beyond 25%")
+        out[f"{m}_blank_reason"] = reasons
+    return out
 
 
 def plot_across_counties(res, tag, out_dir):
     """Three figures from the results table, one panel per metric.
-      distribution    how implied noise varies across counties
-                      (title counts counties even 25% noise can't explain)
+      distribution    how implied noise varies across counties. The title
+                      counts the counties NOT in the bars, split by reason:
+                      "beyond 25%" (noise can't explain it) and
+                      "progressive" (noise can never produce it)
       noise_vs_sales  implied noise vs number of sales: does sample size
                       change the answer?
       score_vs_sales  the REAL score vs number of sales: do small counties
@@ -583,13 +685,24 @@ def plot_across_counties(res, tag, out_dir):
     ok = res[res["status"] == "ok"]
     if len(ok) == 0:
         return
-    figs = {name: plt.subplots(2, 3, figsize=(13, 8))
+    figs = {name: plt.subplots(4, 3, figsize=(13, 15))
             for name in ["distribution", "noise_vs_sales", "score_vs_sales"]}
     for i, m in enumerate(PLOT_METRICS):
         noise = ok[f"{m}_implied_noise"] * 100
         a1 = figs["distribution"][1].flat[i]
         a1.hist(noise.dropna(), bins=30)
-        a1.set_title(f"{m}  ({noise.isna().sum()} of {len(ok)} over 25%)")
+        reason_col = f"{m}_blank_reason"
+        if m == "median_ratio":
+            a1.set_title(f"{m}  (noise doesn't move it)", fontsize=10)
+        elif reason_col in ok.columns:
+            n_beyond = (ok[reason_col] == "beyond 25%").sum()
+            n_prog = (ok[reason_col] == "progressive").sum()
+            a1.set_title(f"{m}  ({len(ok)} counties)\n"
+                         f"not shown: {n_beyond} beyond 25%, "
+                         f"{n_prog} progressive", fontsize=10)
+        else:
+            a1.set_title(f"{m}  ({noise.isna().sum()} of {len(ok)} blank)",
+                         fontsize=10)
         a1.set_xlabel("Implied noise (%)")
         a1.set_ylabel("Number of counties")
 
@@ -607,7 +720,7 @@ def plot_across_counties(res, tag, out_dir):
             a.set_xlabel("Number of sales (log scale)")
     for name, (fig, _) in figs.items():
         fig.suptitle(f"All counties, {tag.replace('_', ', ')}")
-        fig.tight_layout()
+        fig.tight_layout(rect=[0, 0, 1, 0.98])  # leave room for the title
         fig.savefig(out_dir / f"counties_{name}_{tag}.png", dpi=120)
         plt.close(fig)
 
@@ -620,17 +733,36 @@ if __name__ == "__main__":
     from pathlib import Path
 
     # ---- Settings: change these ------------------------------------------
-    # Folder with one parquet file per county (unzip "first american data")
-    DATA_DIR = (Path.home() / "regression_bias/first_american_data"
-                / "First American Data Joined")
+    # Folder with the county parquet files (unzipped). It's found RELATIVE
+    # TO THIS SCRIPT: a folder called "first_american_data" sitting next to
+    # this .py file. That way the same file works on any computer (your Mac,
+    # the office computer, rika) without editing paths. The code also looks
+    # inside any subfolders, so it's fine if the files are one level deeper
+    DATA_DIR = Path(__file__).resolve().parent / "first_american_data"
     YEAR = 2016        # which year of sales to use
-    TRIM = True        # True = drop extreme ratios like Eric's code
+    VALUE_COL = "Value"  # "Value" (Eric: start with this) or "MarketTotalValue"
+    FILTERS = {        # Eric's standard filters (True = on, False = off)
+        "highest_sale": False,  # already done in Eric's join script; no effect
+        "value_window": True,   # drop values outside $10k-$5M       (ON)
+        "winsorize": False,     # cap prices/values at 1st/99th pct (off: can
+                                # distort ratios, adds little after the trim)
+        "iqr_trim": True,       # drop ratios outside 1.5 x IQR (IAAO) (ON)
+    }
     ITERS = 100        # simulated samples per noise level
     BOOTSTRAP = 5      # Eric's inner loop (5 = same as his R code; 0 = skip)
     MIN_SALES = 100    # skip counties with fewer sales than this
     SEED = 0           # fixes the random county order
     GRAPH_COUNTIES = ["17031"]  # FIPS codes to also save 12-panel graphs for
                                 # (17031 = Cook County)
+
+    # Check for pyarrow up front (pandas needs it to read .parquet files), so
+    # a missing install stops right away instead of erroring on every county
+    try:
+        import pyarrow  # noqa: F401
+    except ImportError:
+        raise SystemExit("pyarrow isn't installed on this computer. Run:\n"
+                         "    python3 -m pip install pyarrow\n"
+                         "then run this script again.")
 
     # Small counties can make the regressions throw math warnings; they
     # don't stop anything, so hide them to keep the progress output readable
@@ -640,10 +772,14 @@ if __name__ == "__main__":
         warnings.filterwarnings("ignore", category=rank_warning)
 
     # ---- Where results go ---------------------------------------------------
-    # Folder and file names include the year and samples, e.g. "2024_1sample"
+    # Folder and file names include the year, samples, value column and
+    # filters, e.g. "2024_1sample_value_nofilter"
     tag = f"2016_{ITERS}sample{'' if ITERS == 1 else 's'}"
-    if not TRIM:
-        tag += "_notrim"
+    # Value column and filters go in the name too, so runs with different
+    # settings never mix (and don't mix with the earlier MarketTotalValue runs)
+    tag += "_" + ("value" if VALUE_COL == "Value" else "mkt")
+    on = [k for k, v in FILTERS.items() if v]
+    tag += "_" + ("-".join(on) if on else "nofilter")
     out_dir = Path(f"results_{tag}")
     out_dir.mkdir(exist_ok=True)
     results_file = out_dir / f"county_results_{tag}.csv"    # 1 row per county
@@ -651,9 +787,15 @@ if __name__ == "__main__":
 
     # ---- Random order -------------------------------------------------------
     # Same SEED = same order every time, so a resumed run continues in order
-    files = sorted(DATA_DIR.glob("*.parquet"))
+    # Look in the folder AND its subfolders; skip the hidden "._" copies and
+    # "__MACOSX" folder that unzipping on a Mac can create
+    files = sorted(p for p in DATA_DIR.rglob("*.parquet")
+                   if not p.name.startswith("._") and "__MACOSX" not in p.parts)
     if not files:
-        raise SystemExit(f"No .parquet files in {DATA_DIR}. Unzipped yet?")
+        raise SystemExit(
+            f"No .parquet files found in {DATA_DIR}\n"
+            "Check that: (1) a folder called first_american_data is in the "
+            "same folder as this script, and (2) it's unzipped.")
     rng = np.random.default_rng(SEED)
     files = [files[i] for i in rng.permutation(len(files))]
 
@@ -676,8 +818,8 @@ if __name__ == "__main__":
 
         avg = real = implied = None
         try:
-            row, avg, real, implied = run_county(path, YEAR, TRIM, ITERS,
-                                                 BOOTSTRAP, MIN_SALES)
+            row, avg, real, implied = run_county(path, YEAR, VALUE_COL, FILTERS,
+                                                 ITERS, BOOTSTRAP, MIN_SALES)
         except Exception as e:
             # One broken county shouldn't stop the whole run
             row = {"fips": fips, "status": f"error: {e}"}
@@ -708,5 +850,19 @@ if __name__ == "__main__":
         print("\nMedian implied noise across counties, by metric:")
         print(ok[[f"{m}_implied_noise" for m in METRICS]]
               .median().round(4).to_string())
+        # Why was implied noise blank? (built from the saved curves, so this
+        # also works on a finished run without redoing any counties)
+        if curves_file.exists():
+            curves = pd.read_csv(curves_file, dtype={"fips": str})
+            res = blank_reasons(res, curves)
+            labeled_file = out_dir / f"county_results_{tag}_with_reasons.csv"
+            res.to_csv(labeled_file, index=False)
+            ok = res[res["status"] == "ok"]
+            print("\nCounties with blank implied noise, by reason:")
+            counts = pd.DataFrame({
+                m: ok[f"{m}_blank_reason"].value_counts()
+                for m in METRICS if m != "median_ratio"}).fillna(0).astype(int)
+            print(counts.drop(index="", errors="ignore").T.to_string())
+            print(f"(reasons for each county saved in {labeled_file.name})")
         plot_across_counties(res, tag, out_dir)
     print(f"\nSaved to {out_dir}/")
